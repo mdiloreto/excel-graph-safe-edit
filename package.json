@@ -6,8 +6,15 @@
   "bin": {
     "excel-graph-safe-edit": "dist/src/cli.js"
   },
+  "files": [
+    "dist/src/**/*.js",
+    "dist/src/**/*.d.ts",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
-    "build": "tsc -p tsconfig.json && chmod +x dist/src/cli.js",
+    "build": "tsc -p tsconfig.build.json",
+    "prepare": "npm run build",
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "lint": "eslint ."
@@ -16,6 +23,7 @@
     "excel",
     "microsoft-graph",
     "onedrive",
+    "sharepoint",
     "mcp",
     "agent"
   ],
