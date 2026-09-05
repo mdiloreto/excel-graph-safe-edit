@@ -16,6 +16,8 @@ export interface CliArgs {
   backup_dir?: string;
   values_json?: string;
   formulas_json?: string;
+  input_json?: string;
+  input_file?: string;
 }
 
 const BOOLEAN_OPTIONS = new Set<keyof CliArgs>(['no_persist', 'json', 'help']);
@@ -33,10 +35,13 @@ const VALUE_OPTIONS = new Set<keyof CliArgs>([
   'backup_dir',
   'values_json',
   'formulas_json',
+  'input_json',
+  'input_file',
 ]);
 
 export function parseArgs(argv: string[]): CliArgs {
   const args: CliArgs = { _: [] };
+  const occurrences = new Map<keyof CliArgs, number>();
   let positionalOnly = false;
   for (let index = 0; index < argv.length; index += 1) {
     const token = argv[index];
@@ -50,6 +55,7 @@ export function parseArgs(argv: string[]): CliArgs {
       continue;
     }
     if (token === '-h') {
+      occurrences.set('help', (occurrences.get('help') ?? 0) + 1);
       args.help = true;
       continue;
     }
@@ -65,6 +71,7 @@ export function parseArgs(argv: string[]): CliArgs {
     if (!key) throw new Error(`Invalid option: ${token}`);
     if (BOOLEAN_OPTIONS.has(key)) {
       if (inlineValue !== undefined) throw new Error(`Option --${rawKey} does not accept a value`);
+      occurrences.set(key, (occurrences.get(key) ?? 0) + 1);
       if (key === 'no_persist') args.no_persist = true;
       else if (key === 'json') args.json = true;
       else if (key === 'help') args.help = true;
@@ -76,7 +83,18 @@ export function parseArgs(argv: string[]): CliArgs {
     if (value.trim().length === 0) throw new Error(`Empty value for --${rawKey}`);
     if (inlineValue === undefined) index += 1;
     if (key === 'scope') args.scope = [...(args.scope ?? []), value];
-    else if (key !== '_') args[key] = value as never;
+    else if (key !== '_') {
+      occurrences.set(key, (occurrences.get(key) ?? 0) + 1);
+      args[key] = value as never;
+    }
+  }
+  const uniqueOptions = args._[0] === 'upload-docx'
+    ? ['client_id', 'authority', 'port', 'no_persist', 'json', 'help', 'input_json', 'path', 'drive_id'] as const
+    : args._[0] === 'upload-file'
+      ? ['client_id', 'authority', 'port', 'no_persist', 'json', 'help', 'input_file', 'path', 'drive_id'] as const
+      : [];
+  for (const key of uniqueOptions) {
+      if ((occurrences.get(key) ?? 0) > 1) throw new Error(`Option --${key.replaceAll('_', '-')} may be specified only once`);
   }
   return args;
 }

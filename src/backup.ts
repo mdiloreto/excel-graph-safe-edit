@@ -1,12 +1,19 @@
-import { createHash, randomBytes } from 'node:crypto';
-import { createReadStream, createWriteStream, type Stats } from 'node:fs';
-import { chmod, lstat, link, mkdir, open, rm, stat, unlink, type FileHandle } from 'node:fs/promises';
+import { randomBytes } from 'node:crypto';
+import { type Stats } from 'node:fs';
+import { chmod, lstat, link, mkdir, open, rm, unlink, type FileHandle } from 'node:fs/promises';
 import { basename, dirname, join, resolve } from 'node:path';
-import { pipeline } from 'node:stream/promises';
 import { getAccessToken } from './auth.js';
 import { type AuthConfig, BACKUP_DIR, GRAPH_BASE } from './config.js';
 import { itemPathById } from './excel.js';
-import { graphRequest } from './graph.js';
+import {
+  consumeResponseBody,
+  discardResponse,
+  fetchWithDeadline,
+  graphRequest,
+  resolveTransportDeadlines,
+  type TransportDeadlines,
+} from './graph.js';
+import { hasZipSignature, validateOoxmlFile } from './ooxml.js';
 
 interface DriveItemMetadata {
   id: string;
@@ -27,11 +34,26 @@ export interface LocalBackup {
 }
 
 const MAX_BACKUP_FILE_NAME_LENGTH = 180;
-const END_OF_CENTRAL_DIRECTORY_SIGNATURE = 0x0605_4b50;
-const CENTRAL_DIRECTORY_SIGNATURE = 0x0201_4b50;
-const LOCAL_FILE_HEADER_SIGNATURE = 0x0403_4b50;
-const MAX_EOCD_SEARCH = 65_535 + 22;
+const MAX_BACKUP_BYTES = 100 * 1024 * 1024;
+const BACKUP_TRANSPORT_DEADLINES: TransportDeadlines = {
+  requestMilliseconds: 60_000,
+  bodyMilliseconds: 5 * 60_000,
+  cleanupMilliseconds: 1000,
+};
 const REQUIRED_XLSX_ENTRIES = new Set(['[Content_Types].xml', 'xl/workbook.xml']);
+
+export interface BackupDownloadDependencies {
+  metadata: (config: AuthConfig, path: string) => Promise<DriveItemMetadata>;
+  token: (config: AuthConfig) => Promise<string>;
+  fetch: (url: string, options?: RequestInit) => Promise<Response>;
+  deadlines?: Partial<TransportDeadlines>;
+}
+
+const defaultBackupDependencies: BackupDownloadDependencies = {
+  metadata: (config, path) => graphRequest<DriveItemMetadata>(config, path),
+  token: getAccessToken,
+  fetch: (url, options) => fetch(url, options),
+};
 
 export function backupFileName(
   name: string | undefined,
@@ -47,133 +69,16 @@ export function backupFileName(
 }
 
 export function hasXlsxSignature(header: Uint8Array): boolean {
-  return header.length >= 4 && Buffer.from(header).readUInt32LE(0) === LOCAL_FILE_HEADER_SIGNATURE;
-}
-
-async function readExactly(handle: FileHandle, length: number, position: number): Promise<Buffer> {
-  const buffer = Buffer.alloc(length);
-  let totalRead = 0;
-  while (totalRead < length) {
-    const { bytesRead } = await handle.read(buffer, totalRead, length - totalRead, position + totalRead);
-    if (bytesRead === 0) throw new Error('Backup validation failed: truncated ZIP structure');
-    totalRead += bytesRead;
-  }
-  return buffer;
-}
-
-function findEndOfCentralDirectory(tail: Buffer, fileSize: number): { record: Buffer; offset: number } {
-  for (let index = tail.length - 22; index >= 0; index -= 1) {
-    if (tail.readUInt32LE(index) !== END_OF_CENTRAL_DIRECTORY_SIGNATURE) continue;
-    const commentLength = tail.readUInt16LE(index + 20);
-    if (index + 22 + commentLength !== tail.length) continue;
-    return {
-      record: tail.subarray(index, index + 22),
-      offset: fileSize - tail.length + index,
-    };
-  }
-  throw new Error('Backup validation failed: ZIP end-of-central-directory record is missing or truncated');
-}
-
-async function validateXlsxZip(handle: FileHandle, fileSize: number): Promise<void> {
-  if (fileSize < 22) throw new Error('Backup validation failed: downloaded file is too small to be a ZIP archive');
-  const tailLength = Math.min(fileSize, MAX_EOCD_SEARCH);
-  const tail = await readExactly(handle, tailLength, fileSize - tailLength);
-  const { record: eocd, offset: eocdOffset } = findEndOfCentralDirectory(tail, fileSize);
-  const diskNumber = eocd.readUInt16LE(4);
-  const centralDirectoryDisk = eocd.readUInt16LE(6);
-  const entriesOnDisk = eocd.readUInt16LE(8);
-  const totalEntries = eocd.readUInt16LE(10);
-  const centralDirectorySize = eocd.readUInt32LE(12);
-  const centralDirectoryOffset = eocd.readUInt32LE(16);
-  if (
-    entriesOnDisk === 0xffff
-    || totalEntries === 0xffff
-    || centralDirectorySize === 0xffff_ffff
-    || centralDirectoryOffset === 0xffff_ffff
-  ) throw new Error('Backup validation failed: ZIP64 archives are not supported');
-  if (diskNumber !== 0 || centralDirectoryDisk !== 0 || entriesOnDisk !== totalEntries) {
-    throw new Error('Backup validation failed: multi-disk ZIP archives are not supported');
-  }
-  if (totalEntries === 0 || centralDirectoryOffset + centralDirectorySize !== eocdOffset) {
-    throw new Error('Backup validation failed: invalid ZIP central-directory bounds');
-  }
-
-  const entries = new Set<string>();
-  const localRanges: Array<{ start: number; end: number }> = [];
-  let cursor = centralDirectoryOffset;
-  const centralDirectoryEnd = centralDirectoryOffset + centralDirectorySize;
-  for (let index = 0; index < totalEntries; index += 1) {
-    if (cursor + 46 > centralDirectoryEnd) throw new Error('Backup validation failed: truncated ZIP central-directory entry');
-    const centralHeader = await readExactly(handle, 46, cursor);
-    if (centralHeader.readUInt32LE(0) !== CENTRAL_DIRECTORY_SIGNATURE) {
-      throw new Error('Backup validation failed: invalid ZIP central-directory signature');
-    }
-    const flags = centralHeader.readUInt16LE(8);
-    const compressionMethod = centralHeader.readUInt16LE(10);
-    const compressedSize = centralHeader.readUInt32LE(20);
-    const uncompressedSize = centralHeader.readUInt32LE(24);
-    const fileNameLength = centralHeader.readUInt16LE(28);
-    const extraLength = centralHeader.readUInt16LE(30);
-    const commentLength = centralHeader.readUInt16LE(32);
-    const entryDiskNumber = centralHeader.readUInt16LE(34);
-    const localHeaderOffset = centralHeader.readUInt32LE(42);
-    if (compressedSize === 0xffff_ffff || uncompressedSize === 0xffff_ffff || localHeaderOffset === 0xffff_ffff) {
-      throw new Error('Backup validation failed: ZIP64 entries are not supported');
-    }
-    if ((flags & 0x1) !== 0) throw new Error('Backup validation failed: encrypted ZIP entries are not supported');
-    if (entryDiskNumber !== 0) throw new Error('Backup validation failed: multi-disk ZIP entries are not supported');
-    const centralEntryLength = 46 + fileNameLength + extraLength + commentLength;
-    if (cursor + centralEntryLength > centralDirectoryEnd) throw new Error('Backup validation failed: truncated ZIP central-directory metadata');
-    const fileName = (await readExactly(handle, fileNameLength, cursor + 46)).toString('utf8');
-    entries.add(fileName);
-
-    if (localHeaderOffset + 30 > centralDirectoryOffset) throw new Error('Backup validation failed: invalid ZIP local-header offset');
-    const localHeader = await readExactly(handle, 30, localHeaderOffset);
-    if (localHeader.readUInt32LE(0) !== LOCAL_FILE_HEADER_SIGNATURE) {
-      throw new Error('Backup validation failed: invalid ZIP local-header signature');
-    }
-    const localFileNameLength = localHeader.readUInt16LE(26);
-    const localExtraLength = localHeader.readUInt16LE(28);
-    const localFlags = localHeader.readUInt16LE(6);
-    const localCompressionMethod = localHeader.readUInt16LE(8);
-    if (localFlags !== flags || localCompressionMethod !== compressionMethod) {
-      throw new Error('Backup validation failed: ZIP local and central entry metadata differ');
-    }
-    if ((flags & 0x8) === 0 && (
-      localHeader.readUInt32LE(18) !== compressedSize
-      || localHeader.readUInt32LE(22) !== uncompressedSize
-    )) throw new Error('Backup validation failed: ZIP local and central entry sizes differ');
-    const localFileName = (await readExactly(handle, localFileNameLength, localHeaderOffset + 30)).toString('utf8');
-    if (localFileName !== fileName) throw new Error('Backup validation failed: ZIP local and central entry names differ');
-    const localEntryEnd = localHeaderOffset + 30 + localFileNameLength + localExtraLength + compressedSize;
-    if (localEntryEnd > centralDirectoryOffset) throw new Error('Backup validation failed: ZIP entry data exceeds local-file area');
-    localRanges.push({ start: localHeaderOffset, end: localEntryEnd });
-    cursor += centralEntryLength;
-  }
-  if (cursor !== centralDirectoryEnd) throw new Error('Backup validation failed: ZIP central-directory size does not match its entries');
-  localRanges.sort((left, right) => left.start - right.start);
-  for (let index = 1; index < localRanges.length; index += 1) {
-    if ((localRanges[index - 1]?.end ?? 0) > (localRanges[index]?.start ?? 0)) {
-      throw new Error('Backup validation failed: ZIP local entries overlap');
-    }
-  }
-  for (const requiredEntry of REQUIRED_XLSX_ENTRIES) {
-    if (!entries.has(requiredEntry)) throw new Error(`Backup validation failed: XLSX entry is missing: ${requiredEntry}`);
-  }
+  return hasZipSignature(header);
 }
 
 export async function validateBackupFile(path: string): Promise<{ bytes: number; sha256: string }> {
-  const info = await stat(path);
-  if (!info.isFile() || info.size === 0) throw new Error('Backup validation failed: downloaded file is empty or not regular');
-  const handle = await open(path, 'r');
   try {
-    await validateXlsxZip(handle, info.size);
-  } finally {
-    await handle.close();
+    return await validateOoxmlFile(path, REQUIRED_XLSX_ENTRIES, 'Backup');
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(message.replace('OOXML entry is missing:', 'XLSX entry is missing:'));
   }
-  const hash = createHash('sha256');
-  for await (const chunk of createReadStream(path)) hash.update(chunk as Buffer);
-  return { bytes: info.size, sha256: hash.digest('hex') };
 }
 
 async function ensureBackupDirectory(dir: string): Promise<void> {
@@ -217,24 +122,74 @@ export async function publishBackupFile(
   throw new Error('Could not publish a unique backup file name');
 }
 
+async function writeBoundedResponse(
+  path: string,
+  response: Response,
+  deadlines: TransportDeadlines,
+): Promise<void> {
+  const contentLength = response.headers.get('content-length');
+  if (contentLength && /^\d+$/u.test(contentLength) && BigInt(contentLength) > BigInt(MAX_BACKUP_BYTES)) {
+    await discardResponse(response, deadlines.cleanupMilliseconds);
+    throw new Error(`Backup download exceeded ${MAX_BACKUP_BYTES} bytes`);
+  }
+  let handle: FileHandle;
+  try {
+    handle = await open(path, 'wx', 0o600);
+  } catch (error) {
+    await discardResponse(response, deadlines.cleanupMilliseconds);
+    throw error;
+  }
+  let totalBytes = 0;
+  try {
+    await consumeResponseBody(response, 'Backup download', deadlines, async (reader) => {
+      while (true) {
+        const result = await reader.read();
+        if (result.done) break;
+        const chunk = Buffer.from(result.value);
+        totalBytes += chunk.length;
+        if (totalBytes > MAX_BACKUP_BYTES) {
+          throw new Error(`Backup download exceeded ${MAX_BACKUP_BYTES} bytes`);
+        }
+        let written = 0;
+        while (written < chunk.length) {
+          const writeResult = await handle.write(chunk, written, chunk.length - written);
+          if (writeResult.bytesWritten === 0) throw new Error('Backup download could not write the response body');
+          written += writeResult.bytesWritten;
+        }
+      }
+    });
+  } finally {
+    await handle.close();
+  }
+}
+
 export async function downloadBackup(
   config: AuthConfig,
   itemId: string,
   dir = BACKUP_DIR,
   driveId?: string,
+  dependencies: BackupDownloadDependencies = defaultBackupDependencies,
 ): Promise<LocalBackup> {
+  const deadlines = resolveTransportDeadlines(BACKUP_TRANSPORT_DEADLINES, dependencies.deadlines);
   await ensureBackupDirectory(dir);
   const itemPath = itemPathById(itemId, driveId);
-  const metadata = await graphRequest<DriveItemMetadata>(config, itemPath);
-  const token = await getAccessToken(config);
-  const response = await fetch(`${GRAPH_BASE}${itemPath}/content`, {
-    headers: { Authorization: `Bearer ${token}` },
-  });
-  if (!response.ok || !response.body) throw new Error(`Backup download failed: ${response.status}`);
+  const metadata = await dependencies.metadata(config, itemPath);
+  const token = await dependencies.token(config);
+  const response = await fetchWithDeadline(
+    dependencies.fetch,
+    `${GRAPH_BASE}${itemPath}/content`,
+    { headers: { Authorization: `Bearer ${token}` } },
+    'Backup download request',
+    deadlines,
+  );
+  if (!response.ok) {
+    await discardResponse(response, deadlines.cleanupMilliseconds);
+    throw new Error(`Backup download failed: ${response.status}`);
+  }
 
   const tempPath = join(dir, `.backup-${process.pid}-${randomBytes(12).toString('hex')}.partial`);
   try {
-    await pipeline(response.body, createWriteStream(tempPath, { flags: 'wx', mode: 0o600 }));
+    await writeBoundedResponse(tempPath, response, deadlines);
     await chmod(tempPath, 0o600);
     const validation = await validateBackupFile(tempPath);
     const finalPath = await publishBackupFile(tempPath, dir, metadata.name);

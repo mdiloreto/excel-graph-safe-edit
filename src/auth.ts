@@ -228,6 +228,10 @@ interface TokenProviderDependencies {
   interactive: (config: AuthConfig) => Promise<TokenResponse>;
 }
 
+function noninteractiveAuthenticationError(): Error {
+  return new Error('Noninteractive authentication failed');
+}
+
 export function assertPersistentTokenStorageSupported(persist: boolean, platform: NodeJS.Platform = process.platform): void {
   if (persist && platform === 'win32') {
     throw new Error('Persistent token storage is not supported securely on Windows; use --no-persist.');
@@ -253,7 +257,13 @@ export function createAccessTokenProvider(overrides: Partial<TokenProviderDepend
     if (memory && memory.expiresAt > now + 120) return memory.accessToken;
 
     if (config.persist) {
-      const cache = await dependencies.readCache(config);
+      let cache: TokenCache | null;
+      try {
+        cache = await dependencies.readCache(config);
+      } catch (error) {
+        if (config.allowInteractive === false) throw noninteractiveAuthenticationError();
+        throw error;
+      }
       if (cache && authConfigsMatch(cache, config)) {
         if (cache.expiresAt > now + 120) {
           inMemoryTokens.set(key, { accessToken: cache.accessToken, expiresAt: cache.expiresAt });
@@ -274,12 +284,14 @@ export function createAccessTokenProvider(overrides: Partial<TokenProviderDepend
             inMemoryTokens.set(key, { accessToken: nextCache.accessToken, expiresAt: nextCache.expiresAt });
             return nextCache.accessToken;
           } catch {
+            if (config.allowInteractive === false) throw noninteractiveAuthenticationError();
             console.error('Cached refresh failed; falling back to browser login.');
           }
         }
       }
     }
 
+    if (config.allowInteractive === false) throw noninteractiveAuthenticationError();
     const token = await dependencies.interactive(config);
     const expiresAt = dependencies.now() + (token.expires_in ?? 3600);
     if (config.persist) {
@@ -304,12 +316,13 @@ export function createAccessTokenProvider(overrides: Partial<TokenProviderDepend
       return Promise.reject(error);
     }
     const key = `${authConfigKey(config)}:${config.persist ? 'persist' : 'no-persist'}`;
-    const existing = inFlight.get(key);
+    const inFlightKey = `${key}:${config.allowInteractive === false ? 'noninteractive' : 'interactive'}`;
+    const existing = inFlight.get(inFlightKey);
     if (existing) return existing;
     const pending = acquire(config, key).finally(() => {
-      if (inFlight.get(key) === pending) inFlight.delete(key);
+      if (inFlight.get(inFlightKey) === pending) inFlight.delete(inFlightKey);
     });
-    inFlight.set(key, pending);
+    inFlight.set(inFlightKey, pending);
     return pending;
   };
 }

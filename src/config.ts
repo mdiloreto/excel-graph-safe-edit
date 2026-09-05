@@ -21,6 +21,7 @@ export interface AuthConfig {
   scopes: string[];
   persist: boolean;
   port: number;
+  allowInteractive?: boolean;
 }
 
 export const SUPPORTED_AUTHORITY_HOSTS = [
@@ -61,6 +62,7 @@ export function buildAuthConfig(options: {
   scopes?: string[];
   noPersist?: boolean;
   port?: number;
+  allowInteractive?: boolean;
 }): AuthConfig {
   const authority = normalizeAuthority(options.authority ?? process.env.EXCEL_GRAPH_AUTHORITY ?? process.env.MICROSOFT_AUTHORITY ?? DEFAULT_AUTHORITY);
   const normalizedScopes = normalizeScopes([...DEFAULT_SCOPES, ...(options.scopes ?? [])]);
@@ -77,5 +79,6 @@ export function buildAuthConfig(options: {
     scopes,
     persist: !options.noPersist,
     port,
+    allowInteractive: options.allowInteractive ?? true,
   };
 }
