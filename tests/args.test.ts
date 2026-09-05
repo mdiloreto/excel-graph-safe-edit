@@ -22,6 +22,43 @@ describe('CLI argument parsing', () => {
     expect(parseArgs(['patch-range', '--values-json=[["a=b"]]']).values_json).toBe('[["a=b"]]');
   });
 
+  it('accepts only a secure input path and target path for upload-docx and rejects duplicates', () => {
+    expect(parseArgs([
+      'upload-docx',
+      '--input-json', '/private/model.json',
+      '--path', 'Class notes/transcript.docx',
+      '--drive-id', 'drive',
+    ])).toMatchObject({
+      _: ['upload-docx'],
+      input_json: '/private/model.json',
+      path: 'Class notes/transcript.docx',
+      drive_id: 'drive',
+    });
+    expect(() => parseArgs(['upload-docx', '--input-json', 'one.json', '--input-json', 'two.json'])).toThrow(/only once/);
+    expect(() => parseArgs(['upload-docx', '--path', 'one.docx', '--path', 'two.docx'])).toThrow(/only once/);
+    for (const option of ['client-id', 'authority', 'port']) {
+      expect(() => parseArgs(['upload-docx', `--${option}`, 'one', `--${option}`, 'two'])).toThrow(/only once/);
+    }
+  });
+
+  it('accepts strict upload-file options and rejects duplicate inputs or targets', () => {
+    expect(parseArgs([
+      'upload-file',
+      '--input-file', '/private/transcript.vtt',
+      '--path', 'Class notes/transcript.vtt',
+      '--drive-id', 'drive',
+    ])).toMatchObject({
+      _: ['upload-file'],
+      input_file: '/private/transcript.vtt',
+      path: 'Class notes/transcript.vtt',
+      drive_id: 'drive',
+    });
+    expect(() => parseArgs(['upload-file', '--input-file', 'one.vtt', '--input-file', 'two.vtt'])).toThrow(/only once/);
+    expect(() => parseArgs(['upload-file', '--path', 'one.vtt', '--path', 'two.vtt'])).toThrow(/only once/);
+    expect(() => parseArgs(['upload-file', '--drive-id', 'one', '--drive-id', 'two'])).toThrow(/only once/);
+    expect(() => parseArgs(['upload-file', '--client-id', 'one', '--client-id', 'two'])).toThrow(/only once/);
+  });
+
   it('validates callback ports', () => {
     expect(() => buildAuthConfig({ clientId: 'client', port: -1 })).toThrow(/port/);
     expect(() => buildAuthConfig({ clientId: 'client', port: 65_536 })).toThrow(/port/);
@@ -87,5 +124,10 @@ describe('CLI argument parsing', () => {
   it('rejects options and positional arguments that do not apply to a command', async () => {
     await expect(main(['metadata', '--client-id', 'client', '--item-id', 'item', '--sheet', 'ignored'])).rejects.toThrow(/not valid for metadata/);
     await expect(main(['whoami', 'extra', '--client-id', 'client'])).rejects.toThrow(/does not accept positional/);
+    await expect(main(['upload-docx', '--values-json', '{}', '--path', 'file.docx'])).rejects.toThrow(/not valid for upload-docx/);
+    await expect(main(['upload-docx', '{"schemaVersion":1}', '--path', 'file.docx'])).rejects.toThrow(/does not accept positional/);
+    await expect(main(['upload-file', '--input-json', 'model.json', '--path', 'file.vtt'])).rejects.toThrow(/not valid for upload-file/);
+    await expect(main(['upload-docx', '--input-file', 'file.vtt', '--path', 'file.docx'])).rejects.toThrow(/not valid for upload-docx/);
+    await expect(main(['upload-file', '--path', 'file.vtt'])).rejects.toThrow(/exactly one --input-file/);
   });
 });

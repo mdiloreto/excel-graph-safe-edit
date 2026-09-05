@@ -1,3 +1,10 @@
+import {
+  driveItemPathById,
+  driveItemPathByPath,
+  encodeGraphPathSegment,
+  encodeOneDrivePath,
+} from './drive.js';
+
 export type GraphCell = string | boolean | null | number;
 
 export type RangeMutation =
@@ -15,37 +22,26 @@ const MAX_EXCEL_COLUMNS = 16_384;
 const MAX_EXCEL_ROWS = 1_048_576;
 export const MAX_WRITE_CELLS = 10_000;
 
-function encodePathSegment(value: string): string {
-  return encodeURIComponent(value).replace(/[!'()*]/g, (character) => `%${character.charCodeAt(0).toString(16).toUpperCase()}`);
-}
-
-export function encodeOneDrivePath(path: string): string {
-  return path.split('/').filter(Boolean).map(encodePathSegment).join('/');
-}
+export { encodeOneDrivePath };
 
 export function odataString(value: string): string {
-  return encodePathSegment(value.replaceAll("'", "''"));
+  return encodeGraphPathSegment(value.replaceAll("'", "''"));
 }
 
 export function itemPathById(itemId: string, driveId?: string): string {
-  if (!itemId.trim()) throw new Error('Item ID must not be empty');
-  if (driveId !== undefined && !driveId.trim()) throw new Error('Drive ID must not be empty');
-  const item = encodePathSegment(itemId);
-  return driveId !== undefined
-    ? `/drives/${encodePathSegment(driveId)}/items/${item}`
-    : `/me/drive/items/${item}`;
+  return driveItemPathById(itemId, driveId);
 }
 
 export function itemPathByDrivePath(path: string): string {
-  return `/me/drive/root:/${encodeOneDrivePath(path)}:`;
+  return driveItemPathByPath(path);
 }
 
 export function workbookRangePath(itemId: string, sheet: string, address: string, driveId?: string): string {
-  return `${itemPathById(itemId, driveId)}/workbook/worksheets/${encodePathSegment(sheet)}/range(address='${odataString(address)}')`;
+  return `${itemPathById(itemId, driveId)}/workbook/worksheets/${encodeGraphPathSegment(sheet)}/range(address='${odataString(address)}')`;
 }
 
 export function worksheetTablesPath(itemId: string, sheet: string, driveId?: string): string {
-  return `${itemPathById(itemId, driveId)}/workbook/worksheets/${encodePathSegment(sheet)}/tables`;
+  return `${itemPathById(itemId, driveId)}/workbook/worksheets/${encodeGraphPathSegment(sheet)}/tables`;
 }
 
 export function worksheetsPath(itemId: string, driveId?: string): string {

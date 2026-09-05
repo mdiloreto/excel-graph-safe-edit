@@ -26,6 +26,7 @@ function config(overrides: Partial<AuthConfig> = {}): AuthConfig {
     scopes: ['openid', 'scope-a'],
     persist: false,
     port: 0,
+    allowInteractive: true,
     ...overrides,
   };
 }
@@ -150,6 +151,76 @@ describe('access token isolation', () => {
     await expect(getAccessToken(config({ persist: false }))).resolves.toBe('one-shot');
     expect(readCache).not.toHaveBeenCalled();
     expect(writeCache).not.toHaveBeenCalled();
+  });
+
+  it('allows a cached refresh in noninteractive mode without invoking browser authentication', async () => {
+    const authConfig = config({ persist: true, allowInteractive: false });
+    const cached: TokenCache = {
+      clientId: authConfig.clientId,
+      authority: authConfig.authority,
+      scopes: authConfig.scopes,
+      accessToken: 'expired-token',
+      refreshToken: 'cached-refresh',
+      expiresAt: 100,
+    };
+    const interactive = vi.fn(async () => interactiveToken('interactive-token'));
+    const refresh = vi.fn(async () => interactiveToken('refreshed-token'));
+    const stderr = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const getAccessToken = createAccessTokenProvider({
+      now: () => 100,
+      readCache: async () => cached,
+      writeCache: async () => undefined,
+      refresh,
+      interactive,
+    });
+
+    await expect(getAccessToken(authConfig)).resolves.toBe('refreshed-token');
+    expect(refresh).toHaveBeenCalledWith(authConfig, 'cached-refresh');
+    expect(interactive).not.toHaveBeenCalled();
+    expect(stderr).not.toHaveBeenCalled();
+  });
+
+  it.each(['missing cache', 'failed refresh', 'cache read failure'])('fails generically for %s in noninteractive mode without browser or stderr output', async (scenario) => {
+    const authConfig = config({ persist: true, allowInteractive: false });
+    const cached: TokenCache | null = scenario === 'failed refresh'
+      ? {
+          clientId: authConfig.clientId,
+          authority: authConfig.authority,
+          scopes: authConfig.scopes,
+          accessToken: 'expired-token',
+          refreshToken: 'cached-refresh',
+          expiresAt: 100,
+        }
+      : null;
+    const interactive = vi.fn(async () => interactiveToken('interactive-token'));
+    const stderr = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const getAccessToken = createAccessTokenProvider({
+      now: () => 100,
+      readCache: async () => {
+        if (scenario === 'cache read failure') throw new Error('sensitive cache path');
+        return cached;
+      },
+      refresh: async () => { throw new Error('sensitive refresh failure'); },
+      interactive,
+    });
+
+    await expect(getAccessToken(authConfig)).rejects.toThrow(/^Noninteractive authentication failed$/u);
+    expect(interactive).not.toHaveBeenCalled();
+    expect(stderr).not.toHaveBeenCalled();
+  });
+
+  it('does not join an in-flight interactive acquisition from noninteractive mode', async () => {
+    let release: ((value: ReturnType<typeof interactiveToken>) => void) | undefined;
+    const interactive = vi.fn(() => new Promise<ReturnType<typeof interactiveToken>>((resolve) => {
+      release = resolve;
+    }));
+    const getAccessToken = createAccessTokenProvider({ interactive });
+    const interactiveRequest = getAccessToken(config({ allowInteractive: true }));
+
+    await expect(getAccessToken(config({ allowInteractive: false }))).rejects.toThrow(/^Noninteractive authentication failed$/u);
+    expect(interactive).toHaveBeenCalledOnce();
+    release?.(interactiveToken('interactive-token'));
+    await expect(interactiveRequest).resolves.toBe('interactive-token');
   });
 });
 

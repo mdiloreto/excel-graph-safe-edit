@@ -1,4 +1,4 @@
-import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -105,6 +105,39 @@ describe('backup helpers', () => {
     }
   });
 
+  it('rejects malformed UTF-8 and terminal-control canaries in OOXML entry names without reflecting them', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'excel-graph-backup-'));
+    temporaryDirectories.push(directory);
+
+    const malformed = createMinimalZip(['bad-name.bin', '[Content_Types].xml', 'xl/workbook.xml']);
+    const centralOffset = malformed.indexOf(Buffer.from([0x50, 0x4b, 0x01, 0x02]));
+    malformed.set([0xc3, 0x28], centralOffset + 46);
+    const malformedPath = join(directory, 'malformed-name.xlsx');
+    await writeFile(malformedPath, malformed, { mode: 0o600 });
+    await expect(validateBackupFile(malformedPath)).rejects.toThrow(/entry name is not valid UTF-8/);
+
+    const canary = '\u001b[31mTERMINAL-CANARY\u0007';
+    const controlledPath = join(directory, 'controlled-name.xlsx');
+    await writeFile(
+      controlledPath,
+      createMinimalZip([canary, '[Content_Types].xml', 'xl/workbook.xml']),
+      { mode: 0o600 },
+    );
+    let error: unknown;
+    try {
+      await validateBackupFile(controlledPath);
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toMatch(/entry name contains a control character/);
+    expect((error as Error).message).not.toContain('TERMINAL-CANARY');
+    expect(Array.from((error as Error).message).some((character) => {
+      const codePoint = character.codePointAt(0) ?? 0;
+      return codePoint < 0x20 || codePoint === 0x7f;
+    })).toBe(false);
+  });
+
   it('publishes with an exclusive hard link and retries a collision', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'excel-graph-backup-'));
     temporaryDirectories.push(directory);
@@ -160,5 +193,35 @@ describe('backup helpers', () => {
 
     expect((await stat(customDirectory)).mode & 0o777).toBe(0o755);
     expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it('cancels a slow-drip authenticated backup body and removes the partial file', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'excel-graph-backup-'));
+    temporaryDirectories.push(directory);
+    let cancelled = false;
+    const body = new ReadableStream<Uint8Array>({
+      start: (controller) => controller.enqueue(Buffer.from([0x50, 0x4b, 0x03, 0x04])),
+      cancel: () => { cancelled = true; },
+    });
+    const fetchMock = vi.fn(async (_url: string, options?: RequestInit) => {
+      expect(new Headers(options?.headers).get('authorization')).toBe('Bearer backup-token');
+      return new Response(body, { status: 200 });
+    });
+
+    await expect(downloadBackup(
+      buildAuthConfig({ clientId: 'client', noPersist: true }),
+      'item',
+      directory,
+      undefined,
+      {
+        metadata: async () => ({ id: 'item', name: 'Book.xlsx' }),
+        token: async () => 'backup-token',
+        fetch: fetchMock,
+        deadlines: { requestMilliseconds: 50, bodyMilliseconds: 10, cleanupMilliseconds: 5 },
+      },
+    )).rejects.toThrow(/^Backup download body timed out$/u);
+
+    expect(cancelled).toBe(true);
+    expect((await readdir(directory)).filter((name) => name.endsWith('.partial'))).toEqual([]);
   });
 });

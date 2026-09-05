@@ -21,6 +21,13 @@ import {
 } from './excel.js';
 import { graphRequest, isAmbiguousWriteError } from './graph.js';
 import { clearTokenCache } from './token-cache.js';
+import {
+  createAndUploadWordDocument,
+  readSecureWordDocumentModel,
+  type WordDocumentModel,
+} from './word.js';
+import { type VerifiedDriveItem } from './drive.js';
+import { createAndUploadLocalFile } from './local-file.js';
 
 function usage(): void {
   console.log(`Usage: excel-graph-safe-edit <command> [options]
@@ -37,8 +44,12 @@ Commands:
   range --item-id <id> [--drive-id <id>] --sheet <sheet> --address <A1:B2>
   backup --item-id <id> [--drive-id <id>] [--dir <directory>]
   patch-range --item-id <id> [--drive-id <id>] --sheet <sheet> --address <A1:B2>
-              (--values-json <json> | --formulas-json <json>) [--backup-dir <directory>]
-                                             Back up, patch, and verify the exact bounded range
+               (--values-json <json> | --formulas-json <json>) [--backup-dir <directory>]
+                                              Back up, patch, and verify the exact bounded range
+  upload-docx --input-json <secure-local-file> --path <OneDrive/path.docx> [--drive-id <id>]
+                                               Safely create, upload, redownload, and verify a DOCX
+  upload-file --input-file <secure-local-file> --path <OneDrive/path.vtt> [--drive-id <id>]
+                                               Safely create, upload, redownload, and verify a file
 
 Options:
   --client-id <id>       Defaults to EXCEL_GRAPH_CLIENT_ID, then MICROSOFT_CLIENT_ID
@@ -73,6 +84,8 @@ const COMMAND_OPTIONS: Record<string, ReadonlySet<keyof CliArgs>> = {
   range: new Set(['item_id', 'drive_id', 'sheet', 'address']),
   backup: new Set(['item_id', 'drive_id', 'dir']),
   'patch-range': new Set(['item_id', 'drive_id', 'sheet', 'address', 'backup_dir', 'values_json', 'formulas_json']),
+  'upload-docx': new Set(['input_json', 'path', 'drive_id']),
+  'upload-file': new Set(['input_file', 'path', 'drive_id']),
 };
 
 function assertCommandShape(command: string, args: CliArgs): void {
@@ -90,6 +103,12 @@ function assertCommandShape(command: string, args: CliArgs): void {
   }
   if (command !== 'search' && args._.length > expectedPositionals) {
     throw new Error(`${command} does not accept positional arguments`);
+  }
+  if (command === 'upload-docx' && (!args.input_json || !args.path)) {
+    throw new Error('Expected exactly one --input-json <secure-local-file> and one --path <OneDrive/path.docx>');
+  }
+  if (command === 'upload-file' && (!args.input_file || !args.path)) {
+    throw new Error('Expected exactly one --input-file <secure-local-file> and one --path <OneDrive/path>');
   }
 }
 
@@ -123,6 +142,14 @@ function parsePort(value: string | undefined): number | undefined {
   if (value === undefined) return undefined;
   if (!/^\d+$/.test(value)) throw new Error('OAuth callback port must be an integer from 0 through 65535');
   return Number(value);
+}
+
+export function commandAllowsInteractiveAuthentication(
+  command: string,
+  environment: NodeJS.ProcessEnv = process.env,
+): boolean {
+  return environment.EXCEL_GRAPH_NONINTERACTIVE !== '1'
+    || (command !== 'upload-docx' && command !== 'upload-file');
 }
 
 function errorMessage(error: unknown): string {
@@ -210,6 +237,45 @@ export async function patchRange(
   });
 }
 
+interface UploadDocxDependencies {
+  readModel: (path: string) => Promise<WordDocumentModel>;
+  upload: typeof createAndUploadWordDocument;
+}
+
+export async function uploadDocx(
+  config: ReturnType<typeof buildAuthConfig>,
+  args: CliArgs,
+  dependencies: UploadDocxDependencies = {
+    readModel: readSecureWordDocumentModel,
+    upload: createAndUploadWordDocument,
+  },
+): Promise<VerifiedDriveItem> {
+  if (!args.input_json || !args.path) {
+    throw new Error('Expected exactly one --input-json <secure-local-file> and one --path <OneDrive/path.docx>');
+  }
+  const model = await dependencies.readModel(args.input_json);
+  return dependencies.upload(config, { model, path: args.path, driveId: args.drive_id });
+}
+
+interface UploadFileDependencies {
+  upload: typeof createAndUploadLocalFile;
+}
+
+export async function uploadFile(
+  config: ReturnType<typeof buildAuthConfig>,
+  args: CliArgs,
+  dependencies: UploadFileDependencies = { upload: createAndUploadLocalFile },
+): Promise<VerifiedDriveItem> {
+  if (!args.input_file || !args.path) {
+    throw new Error('Expected exactly one --input-file <secure-local-file> and one --path <OneDrive/path>');
+  }
+  return dependencies.upload(config, {
+    inputFile: args.input_file,
+    path: args.path,
+    driveId: args.drive_id,
+  });
+}
+
 export async function main(argv = process.argv.slice(2)): Promise<void> {
   const args = parseArgs(argv);
   const command = args._[0];
@@ -217,7 +283,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     usage();
     return;
   }
-  const knownCommands = new Set(['login', 'logout', 'whoami', 'search', 'metadata', 'worksheets', 'tables', 'range', 'backup', 'patch-range']);
+  const knownCommands = new Set(['login', 'logout', 'whoami', 'search', 'metadata', 'worksheets', 'tables', 'range', 'backup', 'patch-range', 'upload-docx', 'upload-file']);
   if (!knownCommands.has(command)) throw new Error(`Unknown command: ${command}`);
   assertCommandShape(command, args);
   const callbackPort = parsePort(args.port);
@@ -236,6 +302,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     scopes: args.scope,
     noPersist: args.no_persist,
     port: callbackPort,
+    allowInteractive: commandAllowsInteractiveAuthentication(command),
   });
 
   if (command === 'login') {
@@ -285,6 +352,14 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   }
   if (command === 'patch-range') {
     jsonOut(await patchRange(config, args), args.json);
+    return;
+  }
+  if (command === 'upload-docx') {
+    jsonOut(await uploadDocx(config, args), args.json);
+    return;
+  }
+  if (command === 'upload-file') {
+    jsonOut(await uploadFile(config, args), args.json);
     return;
   }
 }
