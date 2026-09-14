@@ -155,8 +155,7 @@ export function commandAllowsInteractiveAuthentication(
   command: string,
   environment: NodeJS.ProcessEnv = process.env,
 ): boolean {
-  return environment.EXCEL_GRAPH_NONINTERACTIVE !== '1'
-    || (command !== 'upload-docx' && command !== 'upload-file');
+  return environment.EXCEL_GRAPH_NONINTERACTIVE !== '1' || command === 'login';
 }
 
 function errorMessage(error: unknown): string {
