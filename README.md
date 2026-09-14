@@ -30,6 +30,17 @@ Authentication uses authorization-code flow with PKCE and a loopback callback. I
 
 Tokens are reused only for the same client ID, normalized authority, normalized scope set, and persistence mode. The persistent cache is stored at `~/.local/state/opencode-excel-graph/token-cache.json` with restricted permissions. Malformed cache files are quarantined, and logout removes active, quarantined, and abandoned temporary cache artifacts. Because POSIX modes do not enforce a private Windows DACL, persistent authentication fails closed on Windows; use `--no-persist` there. `--no-persist` removes `offline_access` from defaults and does not read or write the token cache.
 
+For unattended services, initialize a separate key and use the encrypted MSAL Device Code profile:
+
+```bash
+node dist/src/cli.js init-cache-key --cache-key-file ~/.local/share/my-service/msal-cache.key
+node dist/src/cli.js login --client-id <public-client-id> \
+  --cache-key-file ~/.local/share/my-service/msal-cache.key \
+  --cache-path ~/.local/state/my-service/msal-cache.enc
+```
+
+The key and AES-256-GCM cache are separate owner-only files. MSAL persists refresh state in the encrypted cache, serializes access across processes, refreshes silently for unattended commands, uses Device Code only for explicit interactive login, and fails closed when more than one account exists. Set `EXCEL_GRAPH_CACHE_KEY_FILE` and `EXCEL_GRAPH_CACHE_PATH` instead of repeating the options in a service environment. Encrypted logout resolves those environment variables and removes only the selected encrypted cache; it does not delete the key.
+
 Set `EXCEL_GRAPH_NONINTERACTIVE=1` for unattended `upload-docx` and `upload-file` automation. Those commands may reuse a valid in-memory or persistent token and may refresh a matching cached token, but they never launch a browser or print an authorization URL; missing, invalid, or unrefreshable cache state fails with a generic authentication error. The explicit `login` command remains interactive even when the flag is set.
 
 ## OneDrive and SharePoint drives

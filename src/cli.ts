@@ -4,7 +4,8 @@ import { fileURLToPath } from 'node:url';
 import { parseArgs, type CliArgs } from './args.js';
 import { getAccessToken } from './auth.js';
 import { downloadBackup, type LocalBackup } from './backup.js';
-import { buildAuthConfig, CACHE_PATH } from './config.js';
+import { buildAuthConfig, CACHE_PATH, ENCRYPTED_CACHE_PATH } from './config.js';
+import { clearEncryptedMsalCache, createEncryptedCacheKey } from './encrypted-msal-cache.js';
 import {
   assertBoundedWriteRange,
   itemPathByDrivePath,
@@ -33,7 +34,8 @@ function usage(): void {
   console.log(`Usage: excel-graph-safe-edit <command> [options]
 
 Commands:
-  login [--no-persist]                       Open browser login and optionally cache the token
+  init-cache-key --cache-key-file <path>     Create a private encryption key for persistent MSAL auth
+  login [--no-persist]                       Authenticate and optionally cache the token
   logout                                    Remove cached credentials
   whoami [--no-persist]                      Show signed-in account and default drive metadata
   search <query>                             Search the current user's OneDrive (not other drives)
@@ -56,6 +58,8 @@ Options:
   --authority <url>      Defaults to EXCEL_GRAPH_AUTHORITY or the consumers authority
   --scope <scope>        Repeatable; adds scopes while retaining all required defaults
   --port <0-65535>       Localhost callback port; 0 (the default) selects a free port
+  --cache-key-file <path> Use encrypted MSAL cache and Device Code authentication
+  --cache-path <path>     Override encrypted MSAL cache path
   --no-persist           Never read or write the token cache; required on Windows
   --json                 Emit compact JSON where supported
   --help, -h             Show this help
@@ -72,8 +76,11 @@ function assertNoResourceSelector(command: string, args: CliArgs): void {
   }
 }
 
-const GLOBAL_OPTIONS = new Set<keyof CliArgs>(['client_id', 'authority', 'scope', 'port', 'no_persist', 'json', 'help']);
+const GLOBAL_OPTIONS = new Set<keyof CliArgs>([
+  'client_id', 'authority', 'scope', 'port', 'no_persist', 'json', 'help', 'cache_key_file', 'cache_path',
+]);
 const COMMAND_OPTIONS: Record<string, ReadonlySet<keyof CliArgs>> = {
+  'init-cache-key': new Set(['cache_key_file']),
   login: new Set(),
   logout: new Set(),
   whoami: new Set(),
@@ -283,16 +290,33 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     usage();
     return;
   }
-  const knownCommands = new Set(['login', 'logout', 'whoami', 'search', 'metadata', 'worksheets', 'tables', 'range', 'backup', 'patch-range', 'upload-docx', 'upload-file']);
+  const knownCommands = new Set(['init-cache-key', 'login', 'logout', 'whoami', 'search', 'metadata', 'worksheets', 'tables', 'range', 'backup', 'patch-range', 'upload-docx', 'upload-file']);
   if (!knownCommands.has(command)) throw new Error(`Unknown command: ${command}`);
   assertCommandShape(command, args);
   const callbackPort = parsePort(args.port);
 
+  if (command === 'init-cache-key') {
+    assertNoResourceSelector(command, args);
+    if (!args.cache_key_file) throw new Error('Expected --cache-key-file <absolute-path>');
+    await createEncryptedCacheKey(args.cache_key_file);
+    jsonOut({ created: true, keyFile: args.cache_key_file }, args.json);
+    return;
+  }
   if (command === 'logout') {
     assertNoResourceSelector(command, args);
     if (args.no_persist) throw new Error('logout cannot be combined with --no-persist');
-    await clearTokenCache();
-    jsonOut({ loggedOut: true, cachePath: CACHE_PATH }, args.json);
+    const effectiveKeyFile = args.cache_key_file ?? process.env.EXCEL_GRAPH_CACHE_KEY_FILE;
+    if (effectiveKeyFile) {
+      const effectiveCachePath = args.cache_path ?? process.env.EXCEL_GRAPH_CACHE_PATH ?? ENCRYPTED_CACHE_PATH;
+      if (!effectiveKeyFile.startsWith('/') || !effectiveCachePath.startsWith('/')) {
+        throw new Error('Encrypted cache paths must be absolute');
+      }
+      await clearEncryptedMsalCache(effectiveCachePath);
+      jsonOut({ loggedOut: true, cachePath: effectiveCachePath }, args.json);
+    } else {
+      await clearTokenCache();
+      jsonOut({ loggedOut: true, cachePath: CACHE_PATH }, args.json);
+    }
     return;
   }
 
@@ -302,13 +326,19 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     scopes: args.scope,
     noPersist: args.no_persist,
     port: callbackPort,
+    cacheKeyFile: args.cache_key_file,
+    cachePath: args.cache_path,
     allowInteractive: commandAllowsInteractiveAuthentication(command),
   });
 
   if (command === 'login') {
     assertNoResourceSelector(command, args);
     await getAccessToken(config);
-    jsonOut({ authenticated: true, persisted: config.persist, cachePath: config.persist ? CACHE_PATH : null }, args.json);
+    jsonOut({
+      authenticated: true,
+      persisted: config.persist,
+      cachePath: config.persist ? (config.cachePath ?? CACHE_PATH) : null,
+    }, args.json);
     return;
   }
   if (command === 'whoami') {

@@ -12,6 +12,7 @@ export const DEFAULT_SCOPES = [
 
 export const STATE_DIR = join(homedir(), '.local/state/opencode-excel-graph');
 export const CACHE_PATH = join(STATE_DIR, 'token-cache.json');
+export const ENCRYPTED_CACHE_PATH = join(STATE_DIR, 'token-cache.enc');
 export const BACKUP_DIR = join(STATE_DIR, 'backups');
 export const GRAPH_BASE = 'https://graph.microsoft.com/v1.0';
 
@@ -22,6 +23,8 @@ export interface AuthConfig {
   persist: boolean;
   port: number;
   allowInteractive?: boolean;
+  cacheKeyFile?: string;
+  cachePath?: string;
 }
 
 export const SUPPORTED_AUTHORITY_HOSTS = [
@@ -63,6 +66,8 @@ export function buildAuthConfig(options: {
   noPersist?: boolean;
   port?: number;
   allowInteractive?: boolean;
+  cacheKeyFile?: string;
+  cachePath?: string;
 }): AuthConfig {
   const authority = normalizeAuthority(options.authority ?? process.env.EXCEL_GRAPH_AUTHORITY ?? process.env.MICROSOFT_AUTHORITY ?? DEFAULT_AUTHORITY);
   const normalizedScopes = normalizeScopes([...DEFAULT_SCOPES, ...(options.scopes ?? [])]);
@@ -73,6 +78,17 @@ export function buildAuthConfig(options: {
   if (!Number.isInteger(port) || port < 0 || port > 65_535) {
     throw new Error('OAuth callback port must be an integer from 0 through 65535');
   }
+  const cacheKeyFile = options.cacheKeyFile ?? process.env.EXCEL_GRAPH_CACHE_KEY_FILE;
+  const cachePath = options.cachePath ?? process.env.EXCEL_GRAPH_CACHE_PATH ?? ENCRYPTED_CACHE_PATH;
+  if (cacheKeyFile !== undefined && !cacheKeyFile.startsWith('/')) {
+    throw new Error('Encrypted cache key path must be absolute');
+  }
+  if (cacheKeyFile !== undefined && !cachePath.startsWith('/')) {
+    throw new Error('Encrypted cache path must be absolute');
+  }
+  if (cacheKeyFile !== undefined && options.noPersist) {
+    throw new Error('--cache-key-file cannot be combined with --no-persist');
+  }
   return {
     clientId,
     authority,
@@ -80,5 +96,6 @@ export function buildAuthConfig(options: {
     persist: !options.noPersist,
     port,
     allowInteractive: options.allowInteractive ?? true,
+    ...(cacheKeyFile ? { cacheKeyFile, cachePath } : {}),
   };
 }

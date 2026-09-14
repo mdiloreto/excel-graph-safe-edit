@@ -4,6 +4,7 @@ import { type Socket } from 'node:net';
 import { authConfigKey, authConfigsMatch, type AuthConfig, CACHE_PATH } from './config.js';
 import { buildAuthorizeUrl, createPkcePair, createState } from './oauth.js';
 import { readTokenCache, type TokenCache, writeTokenCache } from './token-cache.js';
+import { getEncryptedMsalAccessToken } from './msal-auth.js';
 
 interface TokenResponse {
   access_token: string;
@@ -330,6 +331,12 @@ export function createAccessTokenProvider(overrides: Partial<TokenProviderDepend
 const defaultAccessTokenProvider = createAccessTokenProvider();
 
 export function getAccessToken(config: AuthConfig): Promise<string> {
+  if (config.cacheKeyFile) {
+    if (!config.persist || !config.cachePath) {
+      return Promise.reject(new Error('Encrypted MSAL authentication requires persistent cache configuration'));
+    }
+    return getEncryptedMsalAccessToken(config);
+  }
   return defaultAccessTokenProvider(config);
 }
 

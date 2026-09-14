@@ -65,6 +65,22 @@ describe('CLI argument parsing', () => {
     expect(buildAuthConfig({ clientId: 'client', port: 0 }).port).toBe(0);
   });
 
+  it('builds a separate encrypted cache profile from absolute paths', () => {
+    const config = buildAuthConfig({
+      clientId: 'client',
+      cacheKeyFile: '/private/material-archive.key',
+      cachePath: '/private/material-archive.enc',
+    });
+    expect(config.cacheKeyFile).toBe('/private/material-archive.key');
+    expect(config.cachePath).toBe('/private/material-archive.enc');
+    expect(() => buildAuthConfig({ clientId: 'client', cacheKeyFile: 'relative.key' })).toThrow(/absolute/u);
+    expect(() => buildAuthConfig({
+      clientId: 'client',
+      cacheKeyFile: '/private/key',
+      noPersist: true,
+    })).toThrow(/no-persist/u);
+  });
+
   it('splits and adds grouped scope values to required defaults before no-persist filtering', () => {
     const parsed = parseArgs(['login', '--scope', 'openid offline_access scope']);
     const persistentScopes = buildAuthConfig({ clientId: 'client', scopes: parsed.scope }).scopes;
