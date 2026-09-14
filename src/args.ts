@@ -18,6 +18,8 @@ export interface CliArgs {
   formulas_json?: string;
   input_json?: string;
   input_file?: string;
+  cache_key_file?: string;
+  cache_path?: string;
 }
 
 const BOOLEAN_OPTIONS = new Set<keyof CliArgs>(['no_persist', 'json', 'help']);
@@ -37,6 +39,8 @@ const VALUE_OPTIONS = new Set<keyof CliArgs>([
   'formulas_json',
   'input_json',
   'input_file',
+  'cache_key_file',
+  'cache_path',
 ]);
 
 export function parseArgs(argv: string[]): CliArgs {
@@ -89,9 +93,9 @@ export function parseArgs(argv: string[]): CliArgs {
     }
   }
   const uniqueOptions = args._[0] === 'upload-docx'
-    ? ['client_id', 'authority', 'port', 'no_persist', 'json', 'help', 'input_json', 'path', 'drive_id'] as const
+    ? ['client_id', 'authority', 'port', 'no_persist', 'json', 'help', 'input_json', 'path', 'drive_id', 'cache_key_file', 'cache_path'] as const
     : args._[0] === 'upload-file'
-      ? ['client_id', 'authority', 'port', 'no_persist', 'json', 'help', 'input_file', 'path', 'drive_id'] as const
+      ? ['client_id', 'authority', 'port', 'no_persist', 'json', 'help', 'input_file', 'path', 'drive_id', 'cache_key_file', 'cache_path'] as const
       : [];
   for (const key of uniqueOptions) {
       if ((occurrences.get(key) ?? 0) > 1) throw new Error(`Option --${key.replaceAll('_', '-')} may be specified only once`);

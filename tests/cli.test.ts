@@ -32,6 +32,7 @@ describe('noninteractive command policy', () => {
     const environment = { EXCEL_GRAPH_NONINTERACTIVE: '1' };
     expect(commandAllowsInteractiveAuthentication('upload-docx', environment)).toBe(false);
     expect(commandAllowsInteractiveAuthentication('upload-file', environment)).toBe(false);
+    expect(commandAllowsInteractiveAuthentication('whoami', environment)).toBe(false);
     expect(commandAllowsInteractiveAuthentication('login', environment)).toBe(true);
     expect(commandAllowsInteractiveAuthentication('upload-docx', {})).toBe(true);
   });
